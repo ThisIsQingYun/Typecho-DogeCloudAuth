@@ -5,8 +5,8 @@
  * @package DogeCloudAuth
  * @version 1.0.0
  * @description 为多吉云CDN提供URL鉴权功能，防止资源盗链
- * @author DogeCloud Auth Plugin
- * @link https://www.dogecloud.com
+ * @author QingYun
+ * @link https://github.com/ThisIsQingYun/Typecho-DogeCloudAuth
  */
 
 require_once __DIR__ . '/ServiceWorker.php';
