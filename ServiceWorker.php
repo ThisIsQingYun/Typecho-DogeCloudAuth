@@ -358,34 +358,84 @@ class DogeCloudAuth_ServiceWorker extends Typecho_Widget {
                "        return; // 不拦截页面导航请求\n" .
                "    }\n" .
                "    \n" .
-               "    try {\n" .
-               "        const urlObj = new URL(requestUrl);\n" .
-               "        const hostname = urlObj.hostname;\n" .
-               "        const obfuscatedKey = DOGECLOUD_AUTH_CONFIG.domainKeys[hostname];\n" .
-               "        \n" .
-               "        if (obfuscatedKey) {\n" .
+               "    // 增强的请求处理函数\n" .
+               "    async function handleAuthRequest() {\n" .
+               "        try {\n" .
+               "            const urlObj = new URL(requestUrl);\n" .
+               "            const hostname = urlObj.hostname;\n" .
+               "            const obfuscatedKey = DOGECLOUD_AUTH_CONFIG.domainKeys[hostname];\n" .
+               "            \n" .
+               "            if (!obfuscatedKey) {\n" .
+               "                return fetch(event.request);\n" .
+               "            }\n" .
+               "            \n" .
                "            const secretKey = deobfuscateKey(obfuscatedKey);\n" .
-               "            if (secretKey) {\n" .
-               "                const authUrl = generateAuthUrl(requestUrl, secretKey);\n" .
-               "                \n" .
-               "                // 使用鉴权URL发起请求\n" .
-               "                event.respondWith(\n" .
-               "                    fetch(authUrl, {\n" .
+               "            if (!secretKey) {\n" .
+               "                return fetch(event.request);\n" .
+               "            }\n" .
+               "            \n" .
+               "            const authUrl = generateAuthUrl(requestUrl, secretKey);\n" .
+               "            \n" .
+               "            // 尝试发起请求，带重试机制\n" .
+               "            let lastError;\n" .
+               "            for (let attempt = 0; attempt < 3; attempt++) {\n" .
+               "                try {\n" .
+               "                    const response = await fetch(authUrl, {\n" .
                "                        method: event.request.method,\n" .
                "                        headers: event.request.headers,\n" .
                "                        body: event.request.body,\n" .
                "                        mode: event.request.mode,\n" .
                "                        credentials: event.request.credentials,\n" .
-               "                        cache: event.request.cache,\n" .
+               "                        cache: 'no-cache', // 避免缓存过期的鉴权URL\n" .
                "                        redirect: event.request.redirect,\n" .
                "                        referrer: event.request.referrer\n" .
-               "                    })\n" .
-               "                );\n" .
+               "                    });\n" .
+               "                    \n" .
+               "                    // 检查响应状态\n" .
+               "                    if (response.ok) {\n" .
+               "                        return response;\n" .
+               "                    } else if (response.status === 403 || response.status === 401) {\n" .
+               "                        // 鉴权失败，可能是过期，重新生成鉴权URL\n" .
+               "                        console.warn('鉴权失败，重新生成鉴权URL，尝试次数:', attempt + 1);\n" .
+               "                        const newAuthUrl = generateAuthUrl(requestUrl, secretKey);\n" .
+               "                        if (newAuthUrl !== authUrl) {\n" .
+               "                            authUrl = newAuthUrl;\n" .
+               "                            continue;\n" .
+               "                        }\n" .
+               "                    }\n" .
+               "                    \n" .
+               "                    return response;\n" .
+               "                } catch (error) {\n" .
+               "                    lastError = error;\n" .
+               "                    console.warn('Service Worker请求失败，尝试次数:', attempt + 1, error);\n" .
+               "                    \n" .
+               "                    // 如果不是最后一次尝试，等待一段时间后重试\n" .
+               "                    if (attempt < 2) {\n" .
+               "                        await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));\n" .
+               "                    }\n" .
+               "                }\n" .
                "            }\n" .
+               "            \n" .
+               "            // 所有重试都失败，抛出最后的错误\n" .
+               "            throw lastError;\n" .
+               "            \n" .
+               "        } catch (e) {\n" .
+               "            console.error('Service Worker处理请求失败:', e);\n" .
+               "            // 发生错误时，使用原始请求\n" .
+               "            return fetch(event.request);\n" .
                "        }\n" .
-               "    } catch (e) {\n" .
-               "        console.error('Service Worker处理请求失败:', e);\n" .
-               "        // 发生错误时，使用原始请求\n" .
+               "    }\n" .
+               "    \n" .
+               "    // 拦截请求并处理\n" .
+               "    event.respondWith(handleAuthRequest());\n" .
+               "});\n\n" .
+               "\n" .
+               "// 与客户端脚本通信\n" .
+               "self.addEventListener('message', function(event) {\n" .
+               "    if (event.data && event.data.type === 'REFRESH_AUTH') {\n" .
+               "        // 客户端请求刷新鉴权，清除可能的缓存\n" .
+               "        console.log('收到客户端刷新鉴权请求');\n" .
+               "        // 可以在这里添加额外的处理逻辑\n" .
                "    }\n" .
                "});\n\n" .
                
