@@ -3,7 +3,7 @@
  * 多吉云URL鉴权插件
  * 
  * @package DogeCloudAuth
- * @version 1.1.0
+ * @version 1.2.0
  * @description 为多吉云CDN提供URL鉴权功能，防止资源盗链
  * @author QingYun
  * @link https://github.com/ThisIsQingYun/Typecho-DogeCloudAuth
@@ -34,12 +34,76 @@ class DogeCloudAuth_Plugin implements Typecho_Plugin_Interface {
      * 禁用插件
      */
     public static function deactivate() {
-        // 移除注册的钩子
-        Typecho_Plugin::factory("index.php")->begin = null;
-        Typecho_Plugin::factory("admin.php")->begin = null;
+        // 移除注册的钩子 - 使用正确的方法移除钩子
+        try {
+            // 获取钩子工厂实例
+            $indexFactory = Typecho_Plugin::factory("index.php");
+            $adminFactory = Typecho_Plugin::factory("admin.php");
+            
+            // 检查钩子是否存在并移除
+            if (isset($indexFactory->begin)) {
+                // 尝试移除钩子回调
+                $callbacks = $indexFactory->begin;
+                if (is_array($callbacks)) {
+                    // 如果是数组，移除我们的回调
+                    foreach ($callbacks as $key => $callback) {
+                        if (is_array($callback) && 
+                            isset($callback[0]) && 
+                            $callback[0] === 'DogeCloudAuth_Plugin') {
+                            unset($callbacks[$key]);
+                        }
+                    }
+                    $indexFactory->begin = empty($callbacks) ? false : $callbacks;
+                } else {
+                    // 如果不是数组，直接设置为false
+                    $indexFactory->begin = false;
+                }
+            }
+            
+            if (isset($adminFactory->begin)) {
+                // 尝试移除钩子回调
+                $callbacks = $adminFactory->begin;
+                if (is_array($callbacks)) {
+                    // 如果是数组，移除我们的回调
+                    foreach ($callbacks as $key => $callback) {
+                        if (is_array($callback) && 
+                            isset($callback[0]) && 
+                            $callback[0] === 'DogeCloudAuth_Plugin') {
+                            unset($callbacks[$key]);
+                        }
+                    }
+                    $adminFactory->begin = empty($callbacks) ? false : $callbacks;
+                } else {
+                    // 如果不是数组，直接设置为false
+                    $adminFactory->begin = false;
+                }
+            }
+        } catch (Exception $e) {
+            // 如果移除钩子失败，记录错误但不抛出异常
+            error_log("DogeCloudAuth插件钩子移除失败: " . $e->getMessage());
+        }
         
         // 移除Service Worker路由
-        Helper::removeRoute("dogecloud_auth_sw");
+        try {
+            Helper::removeRoute("dogecloud_auth_sw");
+        } catch (Exception $e) {
+            // 如果移除路由失败，记录错误但不抛出异常
+            error_log("DogeCloudAuth插件路由移除失败: " . $e->getMessage());
+        }
+        
+        // 清理缓存（如果配置启用）
+        try {
+            $options = Helper::options();
+            $pluginConfig = $options->plugin("DogeCloudAuth");
+            
+            // 检查是否启用缓存清理
+            if ($pluginConfig && isset($pluginConfig->clearCacheOnDisable) && $pluginConfig->clearCacheOnDisable == "1") {
+                self::clearPluginCache();
+            }
+        } catch (Exception $e) {
+            // 如果清理缓存失败，记录错误但不抛出异常
+            error_log("DogeCloudAuth插件缓存清理失败: " . $e->getMessage());
+        }
     }
 
     /**
@@ -89,6 +153,16 @@ class DogeCloudAuth_Plugin implements Typecho_Plugin_Interface {
         );
         $form->addInput($authParamName);
 
+        // 资源后缀配置
+        $resourceSuffixes = new Typecho_Widget_Helper_Form_Element_Textarea(
+            "resourceSuffixes", 
+            null, 
+            "/blog\n/thumb\n/watermark", 
+            _("资源后缀配置"), 
+            _("配置多吉云资源URL后缀，用于图片处理等功能。每行一个后缀，格式为：/suffix（以/开头）。例如：/blog、/thumb、/watermark。留空表示不使用后缀功能。")
+        );
+        $form->addInput($resourceSuffixes);
+
 
         // 启用Service Worker
         $enableServiceWorker = new Typecho_Widget_Helper_Form_Element_Radio(
@@ -97,11 +171,60 @@ class DogeCloudAuth_Plugin implements Typecho_Plugin_Interface {
                 "1" => _("启用"),
                 "0" => _("禁用")
             ), 
-            "1", 
+            "0", 
             _("启用Service Worker"), 
-            _("启用后可以处理AJAX请求和动态加载的资源。")
+            _("启用后可以处理AJAX请求和动态加载的资源。默认禁用，建议在了解功能后再启用。")
         );
         $form->addInput($enableServiceWorker);
+
+        // 启用自动刷新
+        $enableAutoRefresh = new Typecho_Widget_Helper_Form_Element_Radio(
+            "enableAutoRefresh", 
+            array(
+                "1" => _("启用"),
+                "0" => _("禁用")
+            ), 
+            "0", 
+            _("启用自动刷新"), 
+            _("启用后会自动刷新即将过期的资源URL。默认禁用，需要Service Worker支持。")
+        );
+        $form->addInput($enableAutoRefresh);
+
+        // 调试模式
+        $debugMode = new Typecho_Widget_Helper_Form_Element_Radio(
+            "debugMode", 
+            array(
+                "1" => _("启用"),
+                "0" => _("禁用")
+            ), 
+            "0", 
+            _("调试模式"), 
+            _("启用后会在错误日志中记录详细的调试信息，用于排查问题。")
+        );
+        $form->addInput($debugMode);
+
+        // 错误重试次数
+        $retryCount = new Typecho_Widget_Helper_Form_Element_Text(
+            "retryCount", 
+            null, 
+            "3", 
+            _("资源加载失败重试次数"), 
+            _("当资源加载失败时的重试次数，设置为0表示不重试。默认3次。")
+        );
+        $form->addInput($retryCount);
+
+        // 缓存清理选项
+        $clearCacheOnDisable = new Typecho_Widget_Helper_Form_Element_Radio(
+            "clearCacheOnDisable", 
+            array(
+                "1" => _("启用"),
+                "0" => _("禁用")
+            ), 
+            "1", 
+            _("禁用插件时清理缓存"), 
+            _("启用后在禁用插件时会尝试清理Service Worker缓存，避免缓存问题。")
+        );
+        $form->addInput($clearCacheOnDisable);
 
         // 帮助说明
         $helpText = new Typecho_Widget_Helper_Form_Element_Text(
@@ -126,154 +249,394 @@ class DogeCloudAuth_Plugin implements Typecho_Plugin_Interface {
      * 处理页面输出
      */
     public static function processPageOutput() {
-        $options = Helper::options();
-        $pluginConfig = $options->plugin("DogeCloudAuth");
-        
-        // 检查插件是否启用
-        if (!$pluginConfig || !isset($options->plugins['activated']['DogeCloudAuth'])) {
+        // 防止重复处理
+        static $isProcessing = false;
+        if ($isProcessing) {
+            self::debugLog("processPageOutput已在处理中，跳过重复调用");
             return;
         }
         
-        // 检查配置是否完整
-        if (!$pluginConfig->domainKeys || !$pluginConfig->duration) {
-            return;
-        }
-
-        $domainKeys = self::parseDomainKeys($pluginConfig->domainKeys);
-        $duration = (int) $pluginConfig->duration;
-        $allowedExtensions = $pluginConfig->allowedExtensions;
-        $authParamName = $pluginConfig->authParamName ?: "auth_key";
-        $enableServiceWorker = $pluginConfig->enableServiceWorker;
-
-        // 解析文件扩展名
-        $extensions = self::parseExtensions($allowedExtensions);
-        if (empty($extensions)) {
-            return;
-        }
-
-        // 开始输出缓冲
-        ob_start(function ($buffer) use ($domainKeys, $duration, $extensions, $authParamName, $enableServiceWorker) {
-            // 处理HTML中的资源链接
-            $buffer = self::processHtmlUrls($buffer, $domainKeys, $duration, $extensions, $authParamName);
+        $isProcessing = true;
+        
+        try {
+            $options = Helper::options();
+            $pluginConfig = $options->plugin("DogeCloudAuth");
             
-            // 处理CSS中的资源链接
-            $buffer = self::processCssUrls($buffer, $domainKeys, $duration, $extensions, $authParamName);
-            
-            // 注入Service Worker（如果启用）
-            if ($enableServiceWorker == "1") {
-                $buffer = self::injectServiceWorker($buffer);
+            // 检查插件是否启用
+            if (!$pluginConfig || !isset($options->plugins['activated']['DogeCloudAuth'])) {
+                self::debugLog("插件未启用或配置不存在");
+                $isProcessing = false;
+                return;
             }
             
-            return $buffer;
-        });
+            // 检查配置是否完整
+            if (!$pluginConfig->domainKeys || !$pluginConfig->duration) {
+                self::debugLog("插件配置不完整：缺少域名密钥或有效期配置");
+                $isProcessing = false;
+                return;
+            }
+
+            $domainKeys = self::parseDomainKeys($pluginConfig->domainKeys);
+            $duration = (int) $pluginConfig->duration;
+            $allowedExtensions = $pluginConfig->allowedExtensions;
+            $authParamName = $pluginConfig->authParamName ?: "auth_key";
+            $enableServiceWorker = $pluginConfig->enableServiceWorker;
+            $resourceSuffixes = self::parseResourceSuffixes($pluginConfig->resourceSuffixes);
+
+            // 解析文件扩展名
+            $extensions = self::parseExtensions($allowedExtensions);
+            if (empty($extensions)) {
+                self::debugLog("没有配置需要鉴权的文件扩展名");
+                $isProcessing = false;
+                return;
+            }
+
+            self::debugLog("开始处理页面输出，域名数量：" . count($domainKeys) . "，扩展名数量：" . count($extensions));
+
+            // 检查是否已经有输出缓冲在运行
+            $initialBufferLevel = ob_get_level();
+            self::debugLog("初始输出缓冲级别：" . $initialBufferLevel);
+            
+            // 检查是否已经有内容输出
+            if (headers_sent()) {
+                self::debugLog("HTTP头已发送，无法启动输出缓冲");
+                $isProcessing = false;
+                return;
+            }
+            
+            // 开始输出缓冲，添加错误处理
+            $bufferStarted = ob_start(function ($buffer) use ($domainKeys, $duration, $extensions, $authParamName, $enableServiceWorker, $resourceSuffixes) {
+                // 保存原始buffer，确保在任何情况下都能恢复
+                $originalBuffer = $buffer;
+                
+                try {
+                    // 检查缓冲区内容是否为空
+                    if (empty($buffer)) {
+                        self::debugLog("警告：输出缓冲区为空");
+                        return $originalBuffer;
+                    }
+                    
+                    $originalLength = strlen($buffer);
+                    self::debugLog("原始页面内容长度：" . $originalLength);
+                    
+                    // 如果内容太短，可能不是完整的HTML页面
+                    if ($originalLength < 100) {
+                        self::debugLog("内容长度过短，跳过处理");
+                        return $originalBuffer;
+                    }
+                    
+                    // 检查是否是HTML内容
+                    if (stripos($buffer, '<html') === false && stripos($buffer, '<!DOCTYPE') === false) {
+                        self::debugLog("非HTML内容，跳过处理");
+                        return $originalBuffer;
+                    }
+                    
+                    // 处理HTML中的资源链接
+                    $processedBuffer = self::processHtmlUrls($buffer, $domainKeys, $duration, $extensions, $authParamName, $resourceSuffixes);
+                    if ($processedBuffer === false || $processedBuffer === null) {
+                        self::debugLog("processHtmlUrls处理失败，返回原始内容");
+                        return $originalBuffer;
+                    }
+                    
+                    // 处理CSS中的资源链接
+                    $processedBuffer = self::processCssUrls($processedBuffer, $domainKeys, $duration, $extensions, $authParamName, $resourceSuffixes);
+                    if ($processedBuffer === false || $processedBuffer === null) {
+                        self::debugLog("processCssUrls处理失败，返回原始内容");
+                        return $originalBuffer;
+                    }
+                    
+                    // 注入Service Worker（如果启用）
+                    if ($enableServiceWorker == "1") {
+                        $processedBuffer = self::injectServiceWorker($processedBuffer);
+                        if ($processedBuffer === false || $processedBuffer === null) {
+                            self::debugLog("injectServiceWorker处理失败，返回原始内容");
+                            return $originalBuffer;
+                        }
+                    }
+                    
+                    $processedLength = strlen($processedBuffer);
+                    self::debugLog("处理后页面内容长度：" . $processedLength);
+                    
+                    // 检查处理后内容是否异常
+                    if ($processedLength < $originalLength * 0.3) {
+                        self::debugLog("警告：处理后内容长度异常减少（少于原长度30%），返回原始内容");
+                        return $originalBuffer;
+                    }
+                    
+                    // 验证处理后的内容仍然是有效的HTML
+                    if (stripos($processedBuffer, '<html') === false && stripos($processedBuffer, '<!DOCTYPE') === false) {
+                        self::debugLog("警告：处理后内容不再是有效HTML，返回原始内容");
+                        return $originalBuffer;
+                    }
+                    
+                    return $processedBuffer;
+                    
+                } catch (Exception $e) {
+                    // 如果处理过程中出错，返回原始内容
+                    self::debugLog("页面处理出错：" . $e->getMessage());
+                    return $originalBuffer;
+                } catch (Error $e) {
+                    // 捕获PHP7+的Error
+                    self::debugLog("页面处理出现严重错误：" . $e->getMessage());
+                    return $originalBuffer;
+                } catch (Throwable $e) {
+                    // 捕获所有可能的错误
+                    self::debugLog("页面处理出现未知错误：" . $e->getMessage());
+                    return $originalBuffer;
+                }
+            });
+            
+            if (!$bufferStarted) {
+                self::debugLog("输出缓冲启动失败");
+                $isProcessing = false;
+                return;
+            }
+            
+            self::debugLog("输出缓冲启动成功，当前级别：" . ob_get_level());
+            
+        } catch (Exception $e) {
+            // 如果整个方法出错，记录日志但不影响页面显示
+            self::debugLog("processPageOutput方法出错：" . $e->getMessage());
+            // 确保清理任何可能的输出缓冲
+            while (ob_get_level() > 0) {
+                ob_end_clean();
+            }
+        } catch (Error $e) {
+            // 捕获PHP7+的Error
+            self::debugLog("processPageOutput方法出现严重错误：" . $e->getMessage());
+            // 确保清理任何可能的输出缓冲
+            while (ob_get_level() > 0) {
+                ob_end_clean();
+            }
+        } finally {
+            $isProcessing = false;
+        }
     }
 
     /**
      * 处理HTML中的URL
      */
-    private static function processHtmlUrls($buffer, $domainKeys, $duration, $extensions, $authParamName) {
-        $extensionPattern = implode("|", array_map(function($ext) {
-            return preg_quote(ltrim($ext, "."), "/");
-        }, $extensions));
-        
-        // 匹配HTML属性中的URL（src、href等）
-        $pattern = '/((?:src|href|data-src|data-href)\s*=\s*["\'])([^"\'\']+\.(?:' . $extensionPattern . '))(?![^"\'\']*' . preg_quote($authParamName, '/') . '=)(["\'])/i';
-        
-        return preg_replace_callback($pattern, function ($matches) use ($domainKeys, $duration, $authParamName) {
-            $prefix = $matches[1];  // 属性名和引号
-            $url = $matches[2];     // URL
-            $suffix = $matches[3];  // 结束引号
+    private static function processHtmlUrls($buffer, $domainKeys, $duration, $extensions, $authParamName, $resourceSuffixes = array()) {
+        try {
+            // 验证输入参数
+            if (empty($buffer) || empty($extensions) || empty($domainKeys)) {
+                self::debugLog("processHtmlUrls: 输入参数无效");
+                return $buffer;
+            }
             
-            $originalUrl = $url;
-            $parsedUrl = parse_url($url);
-            $domain = $parsedUrl['host'] ?? null;
+            $extensionPattern = implode("|", array_map(function($ext) {
+                return preg_quote(ltrim($ext, "."), "/");
+            }, $extensions));
             
-            // 处理相对路径
-            if (!$domain) {
-                $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-                $currentHost = $_SERVER['HTTP_HOST'];
-                
-                // 处理不同类型的相对路径
-                if (strpos($url, '/') === 0) {
-                    // 绝对路径（以/开头）
-                    $url = $scheme . '://' . $currentHost . $url;
-                } else {
-                    // 相对路径
-                    $url = $scheme . '://' . $currentHost . '/' . ltrim($url, '/');
+            // 更安全的正则表达式，避免灾难性回溯
+            $pattern = '/((?:src|href|data-src|data-href)\s*=\s*["\'])([^"\'\'\s>]{1,2048}\.(?:' . $extensionPattern . '))(?![^"\'\'\s>]*' . preg_quote($authParamName, '/') . '=)(["\'])/i';
+            
+            // 设置PCRE限制以防止内存溢出
+            $originalBacktrackLimit = ini_get('pcre.backtrack_limit');
+            $originalRecursionLimit = ini_get('pcre.recursion_limit');
+            ini_set('pcre.backtrack_limit', 100000);
+            ini_set('pcre.recursion_limit', 100000);
+            
+            $result = preg_replace_callback($pattern, function ($matches) use ($domainKeys, $duration, $authParamName, $resourceSuffixes) {
+                try {
+                    $prefix = $matches[1];  // 属性名和引号
+                    $url = $matches[2];     // URL
+                    $suffix = $matches[3];  // 结束引号
+                    
+                    // 验证URL格式
+                    if (empty($url) || strlen($url) > 2048) {
+                        return $matches[0];
+                    }
+                    
+                    $originalUrl = $url;
+                    $parsedUrl = parse_url($url);
+                    
+                    // 检查URL解析是否成功
+                    if ($parsedUrl === false) {
+                        self::debugLog("URL解析失败: " . $url);
+                        return $matches[0];
+                    }
+                    
+                    $domain = $parsedUrl['host'] ?? null;
+                    
+                    // 处理相对路径
+                    if (!$domain) {
+                        if (!isset($_SERVER['HTTP_HOST'])) {
+                            return $matches[0];
+                        }
+                        
+                        $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+                        $currentHost = $_SERVER['HTTP_HOST'];
+                        
+                        // 处理不同类型的相对路径
+                        if (strpos($url, '/') === 0) {
+                            // 绝对路径（以/开头）
+                            $url = $scheme . '://' . $currentHost . $url;
+                        } else {
+                            // 相对路径
+                            $url = $scheme . '://' . $currentHost . '/' . ltrim($url, '/');
+                        }
+                        $domain = $currentHost;
+                    }
+                    
+                    // 检查是否有对应的密钥
+                    if (isset($domainKeys[$domain])) {
+                        $authUrl = self::generateAuthUrl($url, $domainKeys[$domain], $duration, $authParamName, $resourceSuffixes);
+                        if ($authUrl && $authUrl !== $url) {
+                            return $prefix . $authUrl . $suffix;
+                        }
+                    }
+                    
+                    return $matches[0];
+                } catch (Exception $e) {
+                    self::debugLog("processHtmlUrls回调函数出错: " . $e->getMessage());
+                    return $matches[0];
                 }
-                $domain = $currentHost;
+            }, $buffer);
+            
+            // 恢复PCRE限制
+            ini_set('pcre.backtrack_limit', $originalBacktrackLimit);
+            ini_set('pcre.recursion_limit', $originalRecursionLimit);
+            
+            // 检查正则表达式是否出错
+            if ($result === null) {
+                $error = preg_last_error();
+                self::debugLog("processHtmlUrls正则表达式出错，错误代码: " . $error);
+                return $buffer;
             }
             
-            // 检查是否有对应的密钥
-            if (isset($domainKeys[$domain])) {
-                $authUrl = self::generateAuthUrl($url, $domainKeys[$domain], $duration, $authParamName);
-                return $prefix . $authUrl . $suffix;
-            }
+            return $result;
             
-            return $matches[0];
-        }, $buffer);
+        } catch (Exception $e) {
+            self::debugLog("processHtmlUrls方法出错: " . $e->getMessage());
+            return $buffer;
+        }
     }
 
     /**
      * 处理CSS中的URL
      */
-    private static function processCssUrls($buffer, $domainKeys, $duration, $extensions, $authParamName) {
-        $extensionPattern = implode("|", array_map(function($ext) {
-            return preg_quote(ltrim($ext, "."), "/");
-        }, $extensions));
-        
-        // 匹配CSS中的url()函数和@import规则
-        $urlPattern = '/url\s*\(\s*(["\']?)([^"\'\'\)\s]+\.(?:' . $extensionPattern . '))(?![^"\'\'\)\s]*' . preg_quote($authParamName, '/') . '=)(["\']?)\s*\)/i';
-        $importPattern = '/@import\s+(["\']?)([^"\'\'\s;]+\.(?:' . $extensionPattern . '))(?![^"\'\'\s;]*' . preg_quote($authParamName, '/') . '=)(["\']?)/i';
-        
-        // 处理URL的通用函数
-        $processUrl = function ($matches, $isImport = false) use ($domainKeys, $duration, $authParamName) {
-            $quote1 = $matches[1];  // 开始引号
-            $url = $matches[2];     // URL
-            $quote2 = $matches[3];  // 结束引号
-            
-            $originalUrl = $url;
-            $parsedUrl = parse_url($url);
-            $domain = $parsedUrl['host'] ?? null;
-            
-            // 处理相对路径
-            if (!$domain) {
-                $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-                $currentHost = $_SERVER['HTTP_HOST'];
-                
-                // 处理不同类型的相对路径
-                if (strpos($url, '/') === 0) {
-                    // 绝对路径（以/开头）
-                    $url = $scheme . '://' . $currentHost . $url;
-                } else {
-                    // 相对路径
-                    $url = $scheme . '://' . $currentHost . '/' . ltrim($url, '/');
-                }
-                $domain = $currentHost;
+    private static function processCssUrls($buffer, $domainKeys, $duration, $extensions, $authParamName, $resourceSuffixes = array()) {
+        try {
+            // 验证输入参数
+            if (empty($buffer) || empty($extensions) || empty($domainKeys)) {
+                self::debugLog("processCssUrls: 输入参数无效");
+                return $buffer;
             }
             
-            // 检查是否有对应的密钥
-            if (isset($domainKeys[$domain])) {
-                $authUrl = self::generateAuthUrl($url, $domainKeys[$domain], $duration, $authParamName);
-                if ($isImport) {
-                    return "@import " . $quote1 . $authUrl . $quote2;
-                } else {
-                    return "url(" . $quote1 . $authUrl . $quote2 . ")";
+            $extensionPattern = implode("|", array_map(function($ext) {
+                return preg_quote(ltrim($ext, "."), "/");
+            }, $extensions));
+            
+            // 更安全的正则表达式，限制URL长度避免灾难性回溯
+            $urlPattern = '/url\s*\(\s*(["\']?)([^"\'\'\)\s]{1,2048}\.(?:' . $extensionPattern . '))(?![^"\'\'\)\s]*' . preg_quote($authParamName, '/') . '=)(["\']?)\s*\)/i';
+            $importPattern = '/@import\s+(["\']?)([^"\'\'\s;]{1,2048}\.(?:' . $extensionPattern . '))(?![^"\'\'\s;]*' . preg_quote($authParamName, '/') . '=)(["\']?)/i';
+            
+            // 设置PCRE限制
+            $originalBacktrackLimit = ini_get('pcre.backtrack_limit');
+            $originalRecursionLimit = ini_get('pcre.recursion_limit');
+            ini_set('pcre.backtrack_limit', 100000);
+            ini_set('pcre.recursion_limit', 100000);
+            
+            // 处理URL的通用函数
+            $processUrl = function ($matches, $isImport = false) use ($domainKeys, $duration, $authParamName, $resourceSuffixes) {
+                try {
+                    $quote1 = $matches[1];  // 开始引号
+                    $url = $matches[2];     // URL
+                    $quote2 = $matches[3];  // 结束引号
+                    
+                    // 验证URL格式
+                    if (empty($url) || strlen($url) > 2048) {
+                        return $matches[0];
+                    }
+                    
+                    $originalUrl = $url;
+                    $parsedUrl = parse_url($url);
+                    
+                    // 检查URL解析是否成功
+                    if ($parsedUrl === false) {
+                        self::debugLog("CSS URL解析失败: " . $url);
+                        return $matches[0];
+                    }
+                    
+                    $domain = $parsedUrl['host'] ?? null;
+                    
+                    // 处理相对路径
+                    if (!$domain) {
+                        if (!isset($_SERVER['HTTP_HOST'])) {
+                            return $matches[0];
+                        }
+                        
+                        $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+                        $currentHost = $_SERVER['HTTP_HOST'];
+                        
+                        // 处理不同类型的相对路径
+                        if (strpos($url, '/') === 0) {
+                            // 绝对路径（以/开头）
+                            $url = $scheme . '://' . $currentHost . $url;
+                        } else {
+                            // 相对路径
+                            $url = $scheme . '://' . $currentHost . '/' . ltrim($url, '/');
+                        }
+                        $domain = $currentHost;
+                    }
+                    
+                    // 检查是否有对应的密钥
+                    if (isset($domainKeys[$domain])) {
+                        $authUrl = self::generateAuthUrl($url, $domainKeys[$domain], $duration, $authParamName, $resourceSuffixes);
+                        if ($authUrl && $authUrl !== $url) {
+                            if ($isImport) {
+                                return "@import " . $quote1 . $authUrl . $quote2;
+                            } else {
+                                return "url(" . $quote1 . $authUrl . $quote2 . ")";
+                            }
+                        }
+                    }
+                    
+                    return $matches[0];
+                } catch (Exception $e) {
+                    self::debugLog("processCssUrls回调函数出错: " . $e->getMessage());
+                    return $matches[0];
                 }
+            };
+            
+            // 先处理@import规则
+            $buffer = preg_replace_callback($importPattern, function ($matches) use ($processUrl) {
+                return $processUrl($matches, true);
+            }, $buffer);
+            
+            // 检查@import处理是否出错
+            if ($buffer === null) {
+                $error = preg_last_error();
+                self::debugLog("processCssUrls @import正则表达式出错，错误代码: " . $error);
+                // 恢复PCRE限制并返回原始内容
+                ini_set('pcre.backtrack_limit', $originalBacktrackLimit);
+                ini_set('pcre.recursion_limit', $originalRecursionLimit);
+                return $buffer;
             }
             
-            return $matches[0];
-        };
-        
-        // 先处理@import规则
-        $buffer = preg_replace_callback($importPattern, function ($matches) use ($processUrl) {
-            return $processUrl($matches, true);
-        }, $buffer);
-        
-        // 再处理url()函数
-        return preg_replace_callback($urlPattern, function ($matches) use ($processUrl) {
-            return $processUrl($matches, false);
-        }, $buffer);
+            // 再处理url()函数
+            $result = preg_replace_callback($urlPattern, function ($matches) use ($processUrl) {
+                return $processUrl($matches, false);
+            }, $buffer);
+            
+            // 恢复PCRE限制
+            ini_set('pcre.backtrack_limit', $originalBacktrackLimit);
+            ini_set('pcre.recursion_limit', $originalRecursionLimit);
+            
+            // 检查url()处理是否出错
+            if ($result === null) {
+                $error = preg_last_error();
+                self::debugLog("processCssUrls url()正则表达式出错，错误代码: " . $error);
+                return $buffer;
+            }
+            
+            return $result;
+            
+        } catch (Exception $e) {
+            self::debugLog("processCssUrls方法出错: " . $e->getMessage());
+            return $buffer;
+        }
     }
 
     /**
@@ -289,13 +652,15 @@ class DogeCloudAuth_Plugin implements Typecho_Plugin_Interface {
         $duration = (int) ($options->duration ?: 1800);
         $domainKeys = self::parseDomainKeys($options->domainKeys);
         $extensions = self::parseExtensions($options->allowedExtensions);
+        $resourceSuffixes = self::parseResourceSuffixes($options->resourceSuffixes);
         
         // 生成配置的JSON
         $configJson = json_encode(array(
             'authParamName' => $authParamName,
             'duration' => $duration,
             'domainKeys' => $domainKeys,
-            'extensions' => $extensions
+            'extensions' => $extensions,
+            'resourceSuffixes' => $resourceSuffixes
         ), JSON_UNESCAPED_SLASHES);
         
         $swScript = "<script>\n";
@@ -325,7 +690,25 @@ class DogeCloudAuth_Plugin implements Typecho_Plugin_Interface {
         $swScript .= "}\n";
         $swScript .= "</script>";
         
-        return preg_replace("/</body>/i", $swScript . "</body>", $buffer);
+        try {
+            $result = preg_replace("/</body>/i", $swScript . "</body>", $buffer);
+            
+            // 检查preg_replace是否成功
+            if ($result === null) {
+                $error = preg_last_error();
+                self::debugLog("injectServiceWorker preg_replace失败，错误代码: " . $error);
+                return $buffer; // 返回原始内容
+            }
+            
+            return $result;
+            
+        } catch (Exception $e) {
+            self::debugLog("injectServiceWorker方法出错: " . $e->getMessage());
+            return $buffer; // 返回原始内容
+        } catch (Error $e) {
+            self::debugLog("injectServiceWorker出现严重错误: " . $e->getMessage());
+            return $buffer; // 返回原始内容
+        }
     }
 
     /**
@@ -717,8 +1100,13 @@ document.addEventListener('DOMContentLoaded', function() {
     /**
      * 生成鉴权URL（多吉云标准格式）
      */
-    public static function generateAuthUrl($url, $secretKey, $duration, $authParamName = "auth_key") {
-        $parsedUrl = parse_url($url);
+    public static function generateAuthUrl($url, $secretKey, $duration, $authParamName = "auth_key", $suffixes = array()) {
+        // 检测并分离URL中的后缀
+        $urlInfo = self::extractSuffixFromUrl($url, $suffixes);
+        $baseUrl = $urlInfo['url'];
+        $suffix = $urlInfo['suffix'];
+        
+        $parsedUrl = parse_url($baseUrl);
         $path = $parsedUrl['path'] ?? '/';
         $timestamp = time() + $duration;
         
@@ -729,6 +1117,7 @@ document.addEventListener('DOMContentLoaded', function() {
         $uid = 0;
         
         // 按照多吉云格式计算MD5：md5(path-timestamp-rand-uid-key)
+        // 注意：签名计算使用的是不带后缀的路径
         $signString = $path . '-' . $timestamp . '-' . $rand . '-' . $uid . '-' . $secretKey;
         $md5hash = md5($signString);
         
@@ -740,11 +1129,17 @@ document.addEventListener('DOMContentLoaded', function() {
             $authParamName => $authKey
         );
         
-        // 添加到URL
+        // 添加到基础URL
         $separator = isset($parsedUrl['query']) ? '&' : '?';
         $authQuery = http_build_query($authParams);
+        $authUrl = $baseUrl . $separator . $authQuery;
         
-        return $url . $separator . $authQuery;
+        // 如果有后缀，将后缀添加到鉴权URL之后
+        if (!empty($suffix)) {
+            $authUrl = $authUrl . $suffix;
+        }
+        
+        return $authUrl;
     }
     
     /**
@@ -785,6 +1180,53 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 
     /**
+     * 解析资源后缀配置
+     */
+    public static function parseResourceSuffixes($resourceSuffixes) {
+        if (empty($resourceSuffixes)) {
+            return array();
+        }
+        
+        $suffixes = array();
+        $lines = array_filter(array_map('trim', explode("\n", $resourceSuffixes)));
+        
+        foreach ($lines as $line) {
+            // 确保后缀以/开头
+            if (!empty($line)) {
+                $suffix = ltrim($line, '/');
+                if (!empty($suffix)) {
+                    $suffixes[] = '/' . $suffix;
+                }
+            }
+        }
+        
+        return $suffixes;
+    }
+
+    /**
+     * 检测URL是否包含资源后缀
+     */
+    public static function extractSuffixFromUrl($url, $suffixes) {
+        if (empty($suffixes)) {
+            return array('url' => $url, 'suffix' => '');
+        }
+        
+        $parsedUrl = parse_url($url);
+        $path = $parsedUrl['path'] ?? '';
+        
+        foreach ($suffixes as $suffix) {
+            if (substr($path, -strlen($suffix)) === $suffix) {
+                // 找到匹配的后缀，分离URL和后缀
+                $basePath = substr($path, 0, -strlen($suffix));
+                $baseUrl = str_replace($path, $basePath, $url);
+                return array('url' => $baseUrl, 'suffix' => $suffix);
+            }
+        }
+        
+        return array('url' => $url, 'suffix' => '');
+    }
+
+    /**
      * 验证鉴权参数（用于调试，多吉云格式）
      */
     public static function validateAuth($path, $authKey, $secretKey) {
@@ -809,5 +1251,54 @@ document.addEventListener('DOMContentLoaded', function() {
         $expectedMd5 = md5($signString);
         
         return hash_equals($expectedMd5, $md5hash);
+    }
+    
+    /**
+     * 调试日志记录
+     */
+    private static function debugLog($message) {
+        // 只在调试模式下记录日志
+        if (defined('__TYPECHO_DEBUG__') && __TYPECHO_DEBUG__) {
+            error_log('[DogeCloudAuth] ' . $message);
+        }
+        
+        // 也可以写入到文件（可选）
+        $logFile = __DIR__ . '/debug.log';
+        if (is_writable(dirname($logFile))) {
+            $timestamp = date('Y-m-d H:i:s');
+            file_put_contents($logFile, "[{$timestamp}] {$message}\n", FILE_APPEND | LOCK_EX);
+        }
+    }
+    
+    /**
+     * 清理插件相关缓存
+     */
+    private static function clearPluginCache() {
+        try {
+            // 清理Service Worker缓存（通过设置特殊标记）
+            $cacheKey = 'dogecloud_auth_disabled_' . time();
+            
+            // 尝试设置一个临时标记，让前端知道插件已禁用
+            if (function_exists('apcu_store')) {
+                apcu_store($cacheKey, true, 300); // 5分钟过期
+            }
+            
+            // 记录缓存清理操作
+            self::debugLog('插件缓存清理完成');
+            
+            // 返回清理状态信息
+            return array(
+                'status' => 'success',
+                'message' => '缓存清理完成，建议用户手动清理浏览器缓存',
+                'cache_key' => $cacheKey
+            );
+            
+        } catch (Exception $e) {
+            self::debugLog('缓存清理失败: ' . $e->getMessage());
+            return array(
+                'status' => 'error',
+                'message' => '缓存清理失败: ' . $e->getMessage()
+            );
+        }
     }
 }

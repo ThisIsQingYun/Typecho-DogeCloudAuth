@@ -37,7 +37,8 @@ class DogeCloudAuth_ServiceWorker extends Typecho_Widget {
                 "authParamName" => $options->authParamName ?: "auth_key",
                 "duration" => (int) ($options->duration ?: 1800),
                 "extensions" => $this->parseExtensions($options->allowedExtensions),
-                "domainKeys" => $this->obfuscateDomainKeys($options->domainKeys)
+                "domainKeys" => $this->obfuscateDomainKeys($options->domainKeys),
+                "resourceSuffixes" => $this->parseResourceSuffixes($options->resourceSuffixes)
             );
 
             // 生成Service Worker代码
@@ -85,6 +86,30 @@ class DogeCloudAuth_ServiceWorker extends Typecho_Widget {
     }
 
     /**
+     * 解析多吉云资源后缀配置
+     */
+    private function parseResourceSuffixes($resourceSuffixes) {
+        if (empty($resourceSuffixes)) {
+            return array();
+        }
+        
+        $suffixes = array();
+        $lines = array_filter(array_map('trim', explode("\n", $resourceSuffixes)));
+        
+        foreach ($lines as $line) {
+            if (!empty($line)) {
+                // 确保后缀以/开头
+                if (!str_starts_with($line, '/')) {
+                    $line = '/' . $line;
+                }
+                $suffixes[] = $line;
+            }
+        }
+        
+        return $suffixes;
+    }
+
+    /**
      * 生成Service Worker JavaScript代码
      */
     private function generateServiceWorkerCode($config) {
@@ -92,8 +117,9 @@ class DogeCloudAuth_ServiceWorker extends Typecho_Widget {
         $authParamNameJson = json_encode($config["authParamName"], JSON_UNESCAPED_SLASHES);
         $durationJson = json_encode($config["duration"]);
         $extensionsPattern = implode("|", $config["extensions"]);
-        $extensionsRegexJson = json_encode("\." . "(" . $extensionsPattern . ")" . "$", JSON_UNESCAPED_SLASHES);
+        $extensionsRegexJson = json_encode("." . "(" . $extensionsPattern . ")" . "$", JSON_UNESCAPED_SLASHES);
         $domainKeysJson = json_encode($config["domainKeys"], JSON_UNESCAPED_SLASHES);
+        $resourceSuffixesJson = json_encode($config["resourceSuffixes"], JSON_UNESCAPED_SLASHES);
 
         return "// 多吉云URL鉴权 Service Worker\n" .
                "// 版本: 1.0.0\n" .
@@ -103,7 +129,8 @@ class DogeCloudAuth_ServiceWorker extends Typecho_Widget {
                "    authParamName: {$authParamNameJson},\n" .
                "    duration: {$durationJson},\n" .
                "    extensionsRegex: new RegExp({$extensionsRegexJson}, 'i'),\n" .
-               "    domainKeys: {$domainKeysJson}\n" .
+               "    domainKeys: {$domainKeysJson},\n" .
+               "    resourceSuffixes: {$resourceSuffixesJson}\n" .
                "};\n\n" .
                
                "// 解混淆密钥\n" .
@@ -292,11 +319,31 @@ class DogeCloudAuth_ServiceWorker extends Typecho_Widget {
                "    return result;\n" .
                "}\n\n" .
                
+               "// 提取URL中的资源后缀\n" .
+               "function extractSuffixFromUrl(url) {\n" .
+               "    try {\n" .
+               "        const urlObj = new URL(url);\n" .
+               "        const pathname = urlObj.pathname;\n" .
+               "        \n" .
+               "        // 检查是否包含配置的后缀\n" .
+               "        for (const suffix of DOGECLOUD_AUTH_CONFIG.resourceSuffixes) {\n" .
+               "            if (pathname.endsWith(suffix)) {\n" .
+               "                const basePath = pathname.substring(0, pathname.length - suffix.length);\n" .
+               "                return { basePath, suffix };\n" .
+               "            }\n" .
+               "        }\n" .
+               "        \n" .
+               "        return { basePath: pathname, suffix: '' };\n" .
+               "    } catch (e) {\n" .
+               "        return { basePath: url, suffix: '' };\n" .
+               "    }\n" .
+               "}\n\n" .
+               
                "// 生成鉴权URL（多吉云标准格式）\n" .
                "function generateAuthUrl(url, secretKey) {\n" .
                "    try {\n" .
                "        const urlObj = new URL(url);\n" .
-               "        const path = urlObj.pathname;\n" .
+               "        const { basePath, suffix } = extractSuffixFromUrl(url);\n" .
                "        const timestamp = Math.floor(Date.now() / 1000) + DOGECLOUD_AUTH_CONFIG.duration;\n" .
                "        \n" .
                "        // 生成随机字符串（1-100位，支持大小写字母和数字）\n" .
@@ -305,17 +352,24 @@ class DogeCloudAuth_ServiceWorker extends Typecho_Widget {
                "        // 用户ID，默认为0\n" .
                "        const uid = 0;\n" .
                "        \n" .
-               "        // 按照多吉云格式计算MD5：md5(path-timestamp-rand-uid-key)\n" .
-               "        const signString = path + '-' + timestamp + '-' + rand + '-' + uid + '-' + secretKey;\n" .
+               "        // 按照多吉云格式计算MD5：md5(basePath-timestamp-rand-uid-key)\n" .
+               "        const signString = basePath + '-' + timestamp + '-' + rand + '-' + uid + '-' + secretKey;\n" .
                "        const md5hash = md5(signString);\n" .
                "        \n" .
                "        // 按照多吉云格式组装auth_key：timestamp-rand-uid-md5hash\n" .
                "        const authKey = timestamp + '-' + rand + '-' + uid + '-' + md5hash;\n" .
                "        \n" .
-               "        // 添加鉴权参数\n" .
+               "        // 重新构建URL，先设置基础路径，再添加鉴权参数，最后添加后缀\n" .
+               "        urlObj.pathname = basePath;\n" .
                "        urlObj.searchParams.set(DOGECLOUD_AUTH_CONFIG.authParamName, authKey);\n" .
                "        \n" .
-               "        return urlObj.toString();\n" .
+               "        // 如果有后缀，添加到URL末尾\n" .
+               "        let finalUrl = urlObj.toString();\n" .
+               "        if (suffix) {\n" .
+               "            finalUrl += suffix;\n" .
+               "        }\n" .
+               "        \n" .
+               "        return finalUrl;\n" .
                "    } catch (e) {\n" .
                "        console.error('生成鉴权URL失败:', e);\n" .
                "        return url;\n" .
@@ -344,6 +398,41 @@ class DogeCloudAuth_ServiceWorker extends Typecho_Widget {
                "    }\n" .
                "}\n\n" .
                
+               "// 检查插件是否已禁用\n" .
+               "let pluginDisabled = false;\n" .
+               "let lastPluginCheck = 0;\n" .
+               "const PLUGIN_CHECK_INTERVAL = 30000; // 30秒检查一次\n" .
+               "\n" .
+               "async function checkPluginStatus() {\n" .
+               "    const now = Date.now();\n" .
+               "    if (now - lastPluginCheck < PLUGIN_CHECK_INTERVAL) {\n" .
+               "        return !pluginDisabled;\n" .
+               "    }\n" .
+               "    \n" .
+               "    try {\n" .
+               "        // 尝试访问Service Worker端点来检查插件状态\n" .
+               "        const response = await fetch('/action/dogecloud-auth-sw', {\n" .
+               "            method: 'HEAD',\n" .
+               "            cache: 'no-cache'\n" .
+               "        });\n" .
+               "        \n" .
+               "        pluginDisabled = !response.ok;\n" .
+               "        lastPluginCheck = now;\n" .
+               "        \n" .
+               "        if (pluginDisabled) {\n" .
+               "            console.log('检测到插件已禁用，Service Worker将停止处理请求');\n" .
+               "        }\n" .
+               "        \n" .
+               "        return !pluginDisabled;\n" .
+               "    } catch (e) {\n" .
+               "        // 如果检查失败，假设插件已禁用\n" .
+               "        pluginDisabled = true;\n" .
+               "        lastPluginCheck = now;\n" .
+               "        console.warn('插件状态检查失败，假设插件已禁用:', e);\n" .
+               "        return false;\n" .
+               "    }\n" .
+               "}\n" .
+               "\n" .
                "// Service Worker事件监听\n" .
                "self.addEventListener('fetch', function(event) {\n" .
                "    const requestUrl = event.request.url;\n" .
@@ -361,6 +450,13 @@ class DogeCloudAuth_ServiceWorker extends Typecho_Widget {
                "    // 增强的请求处理函数\n" .
                "    async function handleAuthRequest() {\n" .
                "        try {\n" .
+               "            // 首先检查插件是否已禁用\n" .
+               "            const pluginEnabled = await checkPluginStatus();\n" .
+               "            if (!pluginEnabled) {\n" .
+               "                // 插件已禁用，直接使用原始请求\n" .
+               "                return fetch(event.request);\n" .
+               "            }\n" .
+               "            \n" .
                "            const urlObj = new URL(requestUrl);\n" .
                "            const hostname = urlObj.hostname;\n" .
                "            const obfuscatedKey = DOGECLOUD_AUTH_CONFIG.domainKeys[hostname];\n" .
